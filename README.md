@@ -1,4 +1,4 @@
-# 🚨 Two-Wheeler Crash Detection & Blackbox System
+# Two-Wheeler Crash Detection & Blackbox System
 
 A low-power embedded blackbox for two-wheelers that continuously monitors motion,
 detects crash events, and logs IMU and GPS data to an SD card for post-analysis.
