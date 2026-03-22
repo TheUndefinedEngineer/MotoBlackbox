@@ -1,0 +1,35 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# STM32CubeIDE project files (machine-specific)
+.metadata/
+.settings/
+*.launch
+
+# Object and dependency files
+*.o
+*.d
+*.su
+
+# IDE clutter
+.cproject
+.project
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Test/capture data — log files are hardware output, not source
+*.bin
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
