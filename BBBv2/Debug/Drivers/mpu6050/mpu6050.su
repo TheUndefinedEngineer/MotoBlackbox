@@ -1,0 +1,3 @@
+../Drivers/mpu6050/mpu6050.c:7:16:MPU6050_Check	40	static
+../Drivers/mpu6050/mpu6050.c:18:9:MPU6050_Init	40	static
+../Drivers/mpu6050/mpu6050.c:47:9:MPU6050_Read	32	static
