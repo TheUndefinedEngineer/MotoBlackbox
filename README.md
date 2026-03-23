@@ -144,7 +144,7 @@ stays there until logging completes.
 | SD CS | PA4 | Active-low |
 | UART2 RX | PA3 | GPS NMEA (DMA) |
 | Sensor toggle | PB10 | P-MOSFET gate, active-low |
-| Ignition | PB5 | EXTI rising-edge wakeup |
+| Ignition | PB9 | EXTI rising-edge wakeup |
 
 ---
 
