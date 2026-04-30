@@ -21,11 +21,17 @@ detects crash events, and logs IMU and GPS data to an SD card for post-analysis.
 ## How It Works
 
 ### Continuous recording
+
 The IMU is sampled at **40 Hz**. Each sample is written into a **2400-sample
 (60-second) ring buffer** in RAM. The buffer overwrites itself continuously so
 the most recent 60 seconds are always available.
 
+Only samples that have actually been written are ever logged — a `samples_written`
+counter tracks the true fill level so uninitialised slots are never included if a
+crash occurs before the buffer has been fully populated.
+
 ### Crash detection
+
 Every sample's squared vector magnitude is compared against fixed thresholds
 (no square root required):
 
@@ -39,19 +45,28 @@ samples (~75 ms) must occur before a crash is confirmed, which rejects
 single-sample noise spikes.
 
 ### Post-crash capture
+
 After confirmation, the system collects a further **2 seconds** (80 samples)
 of post-crash data before freezing the buffer.
 
 ### SD logging
-The frozen buffer — containing up to 60 seconds of pre-crash data plus 2 seconds
+
+The frozen buffer — up to 60 seconds of pre-crash data plus 2 seconds
 post-crash — is written to the SD card as a tagged binary log. A GPS record is
 prepended and then interleaved every 40 IMU samples (once per second) to
 geo-reference the event.
 
-### Low-power idle
-When the ignition line goes low, the MCU powers off the sensor rail and enters
-**STOP mode**. A rising edge on the ignition pin triggers an EXTI wakeup,
-after which all peripherals are re-initialised and recording resumes.
+After logging completes, `base_sector` is advanced past the maximum possible
+log size so subsequent crash events are written to fresh sectors without
+overwriting earlier logs.
+
+### IMU fault tolerance
+
+If an I2C read fails, the last successfully read sample is reused so the ring
+buffer always contains plausible data. A 10 ms read-timeout watchdog forces an
+I2C peripheral re-init if the bus stalls. The OLED refresh also monitors I2C
+state and performs a full DeInit/re-init + display re-init if the bus is found
+busy outside of a transaction.
 
 ---
 
@@ -63,25 +78,27 @@ any FAT structures). Each record is prefixed with a 1-byte type tag.
 | Tag | Type | Payload | Size |
 |---|---|---|---|
 | `0x01` | IMU sample | `ax, ay, az, gx, gy, gz` (int16 ×6) + `timestamp` (uint32) | 16 bytes |
-| `0x02` | GPS fix | `lat, lon, speed` (float ×3) + `time[12]` + `timestamp` (uint32) | 28 bytes |
+| `0x02` | GPS fix | `lat, lon, speed` (float ×3) + `time[12]` + `timestamp_ms` (uint32) | 28 bytes |
 | `0x00` | Padding | Zero-fill to next 512-byte boundary | — |
 
 All multi-byte fields are **little-endian**. IMU values are raw ADC counts at
-±16 g / ±2000 dps full-scale. GPS coordinates are decimal degrees.
+±16 g / ±2000 dps full-scale. GPS coordinates are decimal degrees. GPS records
+are only written when a valid satellite fix is active at the time of the crash.
 
 ---
 
 ## Post-Processing Tools
 
-Both tools are in the project root and require Python 3 with `pandas` and
+Both tools are in `Python Scripts/` and require Python 3 with `pandas` and
 `matplotlib`.
 
-### 1. Binary parser — `parse_log.py`
+### 1. Binary parser — `decode-to-csv.py`
 
 Reads `log.bin` and produces `imu.csv` and `gps.csv`:
 
 ```
-python parse_log.py
+cd "Python Scripts"
+python decode-to-csv.py
 ```
 
 Output columns:
@@ -92,14 +109,15 @@ gps.csv  →  latitude, longitude, speed, time, timestamp
 ```
 
 Duplicate timestamps (from SD write retries) are removed automatically and
-records are sorted chronologically.
+records are sorted chronologically. Zero-padded sectors are skipped by seeking
+to the next 512-byte boundary.
 
-### 2. Crash visualiser — `visualise.py`
+### 2. Crash visualiser — `plot.py`
 
 Replicates the firmware detection algorithm exactly and plots four panels:
 
 ```
-python visualise.py imu.csv
+python plot.py imu.csv
 ```
 
 | Panel | Content |
@@ -110,7 +128,8 @@ python visualise.py imu.csv
 | 4 | Binary crash / normal state |
 
 Detected crash windows are shaded across all panels with peak magnitude
-values printed to the console.
+values printed to the console. Gaps in the timestamp sequence are rendered
+as breaks in the plot rather than interpolated lines.
 
 ---
 
@@ -128,7 +147,17 @@ UP: [uptime s]
 ```
 
 On crash detection the screen immediately switches to a **CRASH!** alert and
-stays there until logging completes.
+holds until logging completes, at which point it shows **Log Saved** and
+returns to the normal status view.
+
+---
+
+## RTC
+
+The RTC runs from the internal **LSI** oscillator (~32 kHz). On first boot a
+hardcoded default time is loaded into the RTC and a sentinel value is written to
+backup register `BKP_DR0`; subsequent reboots detect this sentinel and leave the
+running time intact.
 
 ---
 
@@ -136,15 +165,14 @@ stays there until logging completes.
 
 | Signal | Pin | Notes |
 |---|---|---|
-| I2C SDA | PB7 | MPU-6050 + SSD1306 |
-| I2C SCL | PB6 | MPU-6050 + SSD1306 |
+| I2C SDA | PB7 | MPU-6050 + SSD1306 (shared bus) |
+| I2C SCL | PB6 | MPU-6050 + SSD1306 (shared bus) |
 | SPI MOSI | PA7 | SD card |
 | SPI MISO | PA6 | SD card |
 | SPI SCK | PA5 | SD card |
 | SD CS | PA4 | Active-low |
-| UART2 RX | PA3 | GPS NMEA (DMA) |
+| UART2 RX | PA3 | GPS NMEA (DMA, circular) |
 | Sensor toggle | PB10 | P-MOSFET gate, active-low |
-| Ignition | PB5 | EXTI rising-edge wakeup |
 
 ---
 
@@ -153,36 +181,38 @@ stays there until logging completes.
 The project targets the STM32F401CCU6 and is configured for an **84 MHz** system
 clock derived from a 25 MHz HSE crystal via PLL (PLLM=25, PLLN=168, PLLP=2).
 
-Open in STM32CubeIDE and build normally. One external library is required:
+Open in **STM32CubeIDE** and build normally (`Ctrl+B`). One external library
+is required:
 
 | Library | Source | Purpose |
 |---|---|---|
 | stm32-ssd1306 | https://github.com/afiskon/stm32-ssd1306 | SSD1306 OLED driver |
 
 Copy `ssd1306.c`, `ssd1306.h`, and `ssd1306_fonts.h` from that repository into
-the project's `Src` / `Inc` directories. No other external dependencies are needed.
+`Drivers/ssd1306/`. No other external dependencies are needed.
 
 ---
 
 ## Known Limitations
 
 - Threshold values were tuned by bench shaking and have not been validated
-  against real-world crash data. Adjustment will be needed for production use.
-- The SD card is written at SPI initialisation speed (prescaler /256, ~328 kHz).
-  Logging a full 60-second buffer takes several seconds.
+  against real-world crash data.
+- The SD card runs at SPI prescaler /256 (~328 kHz). Logging a full 60-second
+  buffer takes several seconds.
 - GPS coordinates are only logged if a satellite fix was active at the time of
-  the crash. Dead-reckoning or last-known position is not implemented.
-- The RTC is set to a hardcoded default on first boot and must be synchronised
-  from GPS time manually for accurate absolute timestamps.
+  the crash. No dead-reckoning or last-known position fallback.
+- The RTC default time is hardcoded and must be corrected in firmware for
+  accurate absolute timestamps; it is not synchronised from GPS automatically.
 
 ---
 
 ## Possible Improvements
 
 - Sync RTC automatically from GPS NMEA time fields
-- Increase SPI clock after SD initialisation to reduce logging time
+- Switch SD SPI clock to a higher prescaler after initialisation to reduce logging time
 - Add GSM/BLE module to transmit crash location as an alert
 - Implement a complementary or Kalman filter for more robust crash classification
 - Validate and tune thresholds against real accident data
+- Re-add low-power STOP mode with ignition-line wakeup for always-on deployment
 
 ---

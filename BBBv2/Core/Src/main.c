@@ -75,9 +75,6 @@ volatile uint8_t sample_request_flag = 0;   /* set by ISR, cleared in main loop 
 uint8_t  crash_trigger_flag          = 0;   /* set when crash threshold exceeded */
 uint8_t  buffer_freeze_flag          = 0;   /* set when post-crash capture is complete */
 
-volatile uint8_t  ignition_on        = 1;
-volatile uint8_t  wakeup_flag        = 0;
-volatile uint32_t ignition_off_time  = 0;
 static uint8_t crash_displayed = 0;   /* prevents overwriting the crash screen on OLED */
 
 uint16_t write_index    = 0;   /* next slot to write in the ring buffer */
@@ -178,12 +175,19 @@ int main(void)
     __HAL_RCC_PWR_CLK_ENABLE();
     HAL_PWR_EnableBkUpAccess();   /* required before touching RTC/backup registers */
 
-    /* Start LSE oscillator if not already running (e.g. after power-on reset) */
-    if (!(RCC->BDCR & RCC_BDCR_LSERDY))
+    /* Drive sensor rail OFF before LSE wait — on a cold power cycle GPIO is not yet
+       initialised, so Sensor_Toggle (PB10) floats and can accidentally power sensors.
+       Uncontrolled sensor power-on corrupts the I2C bus before MX_I2C1_Init runs. */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
     {
-        RCC->BDCR |= RCC_BDCR_LSEON;
-        while (!(RCC->BDCR & RCC_BDCR_LSERDY));   /* wait for crystal to stabilise */
+        GPIO_InitTypeDef g = {0};
+        g.Pin   = GPIO_PIN_10;
+        g.Mode  = GPIO_MODE_OUTPUT_PP;
+        g.Pull  = GPIO_NOPULL;
+        g.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(GPIOB, &g);
     }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);   /* sensors OFF (active-low) */
 
     MX_RTC_Init();
 
@@ -211,10 +215,34 @@ int main(void)
     SENSORS_POWER_ON();
     HAL_Delay(50);   /* MPU6050 requires ≥30 ms after power rail rises */
 
-    while (!MPU6050_Init(&hi2c1, MPU6050_ADDR_LOW))
+    /* Sensor power-up can glitch SDA/SCL and leave the I2C peripheral in an error
+       state. Re-init after the rail is stable so the first OLED write starts clean. */
+    HAL_I2C_DeInit(&hi2c1);
+    MX_I2C1_Init();
+
+    /* Init OLED first so it can show status regardless of IMU state */
+    ssd1306_Init();
+    ssd1306_Fill(Black);
+    ssd1306_SetCursor(0, 0);
+    ssd1306_WriteString("System Init...", Font_7x10, White);
+    ssd1306_UpdateScreen();
+
     {
-        HAL_Delay(10);   /* WHO_AM_I not responding yet — retry */
+        uint16_t imu_retry = 0;
+        while (!MPU6050_Init(&hi2c1, MPU6050_ADDR_LOW))
+        {
+            HAL_Delay(10);
+            if (++imu_retry >= 50)   /* ~500 ms with no response — bus is stuck */
+            {
+                HAL_I2C_DeInit(&hi2c1);
+                MX_I2C1_Init();
+                imu_retry = 0;
+            }
+        }
     }
+    /* Re-init OLED in case the IMU retry loop triggered I2C bus recovery */
+    ssd1306_Init();
+
     GPS_Init(&huart2, &hdma_usart2_rx);
     HAL_TIM_Base_Start_IT(&htim2);   /* start 1 ms tick */
 
@@ -225,13 +253,11 @@ int main(void)
     last_oled_ms     = system_time_ms;
     Update_Time_Reference();
 
-    /* --- Boot splash screens --- */
-    ssd1306_Init();
     ssd1306_Fill(Black);
     ssd1306_SetCursor(0, 0);
-    ssd1306_WriteString("System Init...", Font_7x10, White);
+    ssd1306_WriteString("IMU OK", Font_7x10, White);
     ssd1306_UpdateScreen();
-    HAL_Delay(1000);
+    HAL_Delay(500);
 
     ssd1306_Fill(Black);
     ssd1306_SetCursor(0, 0);
@@ -347,6 +373,13 @@ int main(void)
                 ssd1306_SetCursor(0, 40);
                 ssd1306_WriteString(line, Font_6x8, White);
 
+                if (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY)
+                {
+                    HAL_I2C_DeInit(&hi2c1);
+                    MX_I2C1_Init();
+                    ssd1306_Init();
+                }
+
                 ssd1306_UpdateScreen();
             }
         }
@@ -357,6 +390,7 @@ int main(void)
         if (sample_request_flag)
         {
             sample_request_flag = 0;
+            uint32_t read_start = system_time_ms;
 
             /* Read sensor; fall back to last good values on I2C failure */
             if (MPU6050_Read(&hi2c1, &buffer[write_index]))
@@ -372,6 +406,12 @@ int main(void)
                 buffer[write_index].gy = last_valid_sample.gy;
                 buffer[write_index].gz = last_valid_sample.gz;
             }
+
+            if ((system_time_ms - read_start) > 10)
+                {
+                    HAL_I2C_DeInit(&hi2c1);
+                    MX_I2C1_Init();
+                }
 
             buffer[write_index].timestamp = system_time_ms;
 
@@ -531,55 +571,6 @@ int main(void)
             crash_displayed = 0;
         }
 
-        /* ---------------------------------------------------------------- */
-        /* IGNITION MONITOR + STOP MODE                                     */
-        /* ---------------------------------------------------------------- */
-        if (HAL_GPIO_ReadPin(Ignition_GPIO_Port, Ignition_Pin) == GPIO_PIN_RESET)
-        {
-            if (ignition_on)
-            {
-                ignition_on       = 0;
-                ignition_off_time = now;
-            }
-
-            /* Debounce: only sleep after ignition has been low for 500 ms */
-            if ((system_time_ms - ignition_off_time) > 500u)
-            {
-                SENSORS_POWER_OFF();
-                /* Enter STOP mode; execution resumes here after EXTI wakeup */
-                HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
-
-                /* Clocks and peripherals must be re-initialised after STOP */
-                SystemClock_Config();
-                MX_I2C1_Init();
-                MX_SPI1_Init();
-                MX_USART2_UART_Init();
-                HAL_TIM_Base_Start_IT(&htim2);
-
-                SENSORS_POWER_ON();
-                HAL_Delay(50);   /* MPU6050 power-on reset time */
-
-                while (!MPU6050_Init(&hi2c1, MPU6050_ADDR_LOW)) { HAL_Delay(10); }
-                GPS_Init(&huart2, &hdma_usart2_rx);
-
-                /* Re-anchor all relative timers to current system_time_ms */
-                last_rtc_sync    = system_time_ms;
-                rtc_sync_ms_ref  = system_time_ms;
-                last_gps_poll_ms = system_time_ms;
-                last_oled_ms     = system_time_ms;
-                Update_Time_Reference();
-
-                gps_fix_valid     = 0;
-                ignition_off_time = system_time_ms;
-                wakeup_flag       = 0;
-            }
-        }
-
-        if (wakeup_flag)
-        {
-            wakeup_flag = 0;
-        }
-
         /* USER CODE END 3 */
     }
 }
@@ -592,10 +583,10 @@ void SystemClock_Config(void)
     __HAL_RCC_PWR_CLK_ENABLE();
     __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
-    /* HSE (external crystal) + LSE for RTC; PLL from HSE */
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE | RCC_OSCILLATORTYPE_LSE;
+    /* HSE (external crystal) + LSI for RTC; PLL from HSE */
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE | RCC_OSCILLATORTYPE_LSI;
     RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
-    RCC_OscInitStruct.LSEState       = RCC_LSE_ON;
+    RCC_OscInitStruct.LSIState       = RCC_LSI_ON;
     RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
     RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
     /* 25 MHz HSE → /25 × 168 / 2 = 84 MHz SYSCLK */
@@ -604,6 +595,11 @@ void SystemClock_Config(void)
     RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
     RCC_OscInitStruct.PLL.PLLQ       = 4;
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC;
+    PeriphClkInit.RTCClockSelection    = RCC_RTCCLKSOURCE_LSI;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) Error_Handler();
 
     RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
                                      | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
@@ -632,13 +628,13 @@ static void MX_RTC_Init(void)
 {
     hrtc.Instance            = RTC;
     hrtc.Init.HourFormat     = RTC_HOURFORMAT_24;
-    /* Async = 128, Sync = 256 → 1 Hz from 32.768 kHz LSE */
+    /* Async = 128, Sync = 250 → 1 Hz from ~32 kHz LSI */
     hrtc.Init.AsynchPrediv   = 127;
-    hrtc.Init.SynchPrediv    = 255;
+    hrtc.Init.SynchPrediv    = 249;
     hrtc.Init.OutPut         = RTC_OUTPUT_DISABLE;
     hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
     hrtc.Init.OutPutType     = RTC_OUTPUT_TYPE_OPENDRAIN;
-    if (HAL_RTC_Init(&hrtc) != HAL_OK) Error_Handler();
+    HAL_RTC_Init(&hrtc);   /* non-fatal: RTC time display is informational only */
 }
 
 static void MX_SPI1_Init(void)
@@ -726,14 +722,6 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
     HAL_GPIO_Init(Sensor_Toggle_GPIO_Port, &GPIO_InitStruct);
 
-    /* Ignition sense: rising edge wakes MCU from STOP mode */
-    GPIO_InitStruct.Pin  = Ignition_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-    GPIO_InitStruct.Pull = GPIO_PULLDOWN;   /* pin idles low when ignition is off */
-    HAL_GPIO_Init(Ignition_GPIO_Port, &GPIO_InitStruct);
-
-    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
 /* USER CODE BEGIN 4 */
@@ -756,16 +744,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 }
 
-/* Rising edge on ignition line wakes MCU and marks ignition as active */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == Ignition_Pin)
-    {
-        ignition_on       = 1;
-        wakeup_flag       = 1;
-        ignition_off_time = system_time_ms;
-    }
-}
 /* USER CODE END 4 */
 
 void Error_Handler(void)
