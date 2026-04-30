@@ -1,9 +1,0 @@
-../Drivers/sdcard/sdcard.c:11:6:SD_DriverInit	16	static
-../Drivers/sdcard/sdcard.c:18:16:SPI_TxRx	32	static
-../Drivers/sdcard/sdcard.c:27:13:SD_Select	8	static
-../Drivers/sdcard/sdcard.c:32:13:SD_Deselect	8	static
-../Drivers/sdcard/sdcard.c:39:13:SD_SendClockTrain	16	static
-../Drivers/sdcard/sdcard.c:48:13:SD_WaitReady	24	static
-../Drivers/sdcard/sdcard.c:65:16:SD_SendCommand	24	static
-../Drivers/sdcard/sdcard.c:95:6:SD_Init	32	static
-../Drivers/sdcard/sdcard.c:185:6:SD_Write	32	static

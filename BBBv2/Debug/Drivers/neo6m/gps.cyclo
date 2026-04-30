@@ -1,5 +1,0 @@
-../Drivers/neo6m/gps.c:47:12:GPS_GetData	1
-../Drivers/neo6m/gps.c:58:6:GPS_Init	1
-../Drivers/neo6m/gps.c:68:14:convert_to_decimal	1
-../Drivers/neo6m/gps.c:77:6:HAL_UARTEx_RxEventCallback	8
-../Drivers/neo6m/gps.c:121:13:GPS_Process	19
